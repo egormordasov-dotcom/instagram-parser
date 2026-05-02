@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: instagram-parser
+    runtime: python
+    buildCommand: pip install -r requirements.txt && python -m playwright install chromium --with-deps
+    startCommand: gunicorn main:app --timeout 1800 --workers 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
