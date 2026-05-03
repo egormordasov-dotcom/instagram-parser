@@ -89,26 +89,45 @@ def login(session):
     print(f"Входим как {IG_LOGIN}...")
 
     try:
-        # Шаг 1 — получаем csrftoken
+        # Шаг 1 — главная страница для начальных куки
+        session.get("https://www.instagram.com/", headers=HEADERS_BROWSER, timeout=15)
+        time.sleep(random.uniform(1, 2))
+
+        # Шаг 2 — страница логина для csrftoken
         resp = session.get(
             "https://www.instagram.com/accounts/login/",
             headers=HEADERS_BROWSER, timeout=15
         )
+        time.sleep(random.uniform(1, 2))
+
         csrf = session.cookies.get("csrftoken", "")
         if not csrf:
             match = re.search(r'"csrf_token":"([^"]+)"', resp.text)
             csrf = match.group(1) if match else ""
+        if not csrf:
+            match = re.search(r'csrftoken=([^;]+)', resp.headers.get("Set-Cookie", ""))
+            csrf = match.group(1) if match else ""
 
-        print(f"  csrf: {csrf[:10]}...")
+        print(f"  csrf: {csrf[:15]}...")
+        if not csrf:
+            print("  Не удалось получить CSRF токен")
+            return False
+
         time.sleep(random.uniform(1, 2))
 
-        # Шаг 2 — отправляем логин
-        login_headers = {**HEADERS_API, "X-CSRFToken": csrf, "Referer": "https://www.instagram.com/accounts/login/"}
+        # Шаг 3 — отправляем логин
+        login_headers = {
+            **HEADERS_API,
+            "X-CSRFToken": csrf,
+            "Referer": "https://www.instagram.com/accounts/login/",
+            "X-Instagram-AJAX": "1",
+        }
         payload = {
             "username": IG_LOGIN,
             "enc_password": f"#PWD_INSTAGRAM_BROWSER:0:{int(time.time())}:{IG_PASSWORD}",
             "queryParams": "{}",
             "optIntoOneTap": "false",
+            "trustedDeviceRecords": "{}",
         }
 
         resp = session.post(
