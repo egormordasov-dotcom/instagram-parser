@@ -1,7 +1,7 @@
 """
-Instagram Parser Server (без браузера)
-=======================================
-Работает на бесплатном Render через HTTP-запросы с куками.
+Instagram Parser Server v3
+===========================
+Использует актуальный Instagram API v1.
 """
 
 import re
@@ -14,32 +14,34 @@ from flask import Flask, request, jsonify
 import requests
 
 app = Flask(__name__)
-
 COOKIES_FILE = "cookies.json"
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/123.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+        "Version/17.0 Mobile/15E148 Safari/604.1"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Referer": "https://www.instagram.com/",
+    "Accept": "*/*",
+    "Accept-Language": "ru-RU,ru;q=0.9",
     "X-IG-App-ID": "936619743392459",
+    "X-ASBD-ID": "129477",
+    "X-IG-WWW-Claim": "0",
+    "Origin": "https://www.instagram.com",
+    "Referer": "https://www.instagram.com/",
 }
 
 
 def load_cookies():
-    """Загружает куки из файла и возвращает dict для requests."""
     if not os.path.exists(COOKIES_FILE):
+        print("ВНИМАНИЕ: файл cookies.json не найден!")
         return {}
     with open(COOKIES_FILE, "r") as f:
         data = json.load(f)
     cookie_list = data if isinstance(data, list) else data.get("cookies", [])
-    return {c["name"]: c["value"] for c in cookie_list if "name" in c and "value" in c}
+    result = {c["name"]: c["value"] for c in cookie_list if "name" in c and "value" in c}
+    print(f"Загружено куки: {len(result)} штук")
+    return result
 
 
 def parse_number(s):
@@ -62,111 +64,118 @@ def extract_articles(caption):
     return [f"#{m.upper()}" for m in matches]
 
 
-def get_profile_posts(username, cookies, session):
-    """Получает список постов профиля через Instagram API."""
-    posts = []
-
-    # Получаем user_id через API
+def get_user_id(username, session, cookies):
+    """Получает user_id через страницу профиля."""
     try:
-        url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
-        resp = session.get(url, headers=HEADERS, cookies=cookies, timeout=15)
-        if resp.status_code != 200:
-            print(f"Ошибка получения профиля @{username}: {resp.status_code}")
-            return []
+        url = f"https://www.instagram.com/{username}/"
+        resp = session.get(url, headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html",
+            "Referer": "https://www.instagram.com/",
+        }, cookies=cookies, timeout=15)
 
-        data = resp.json()
-        user = data.get("data", {}).get("user", {})
-        user_id = user.get("id")
-        if not user_id:
-            print(f"Не найден user_id для @{username}")
-            return []
+        # Ищем user_id в HTML
+        match = re.search(r'"user_id":"(\d+)"', resp.text)
+        if match:
+            return match.group(1)
 
-        print(f"@{username} → user_id: {user_id}")
+        match = re.search(r'"id":"(\d+)"', resp.text)
+        if match:
+            return match.group(1)
+
+        print(f"user_id не найден для @{username}, статус: {resp.status_code}")
+        return None
 
     except Exception as e:
-        print(f"Ошибка профиля @{username}: {e}")
+        print(f"Ошибка получения user_id @{username}: {e}")
+        return None
+
+
+def get_posts_via_api(username, session, cookies):
+    """Получает посты через Instagram API v1."""
+    posts = []
+
+    # Сначала получаем user_id
+    user_id = get_user_id(username, session, cookies)
+    if not user_id:
         return []
 
-    # Получаем посты через GraphQL
-    end_cursor = None
+    print(f"@{username} → user_id: {user_id}")
+
+    max_id = None
     page = 0
 
     while True:
         page += 1
         try:
-            variables = json.dumps({
-                "id": user_id,
-                "first": 50,
-                "after": end_cursor,
-            })
+            url = f"https://www.instagram.com/api/v1/feed/user/{user_id}/"
+            params = {"count": 12}
+            if max_id:
+                params["max_id"] = max_id
 
-            url = (
-                "https://www.instagram.com/graphql/query/"
-                "?query_hash=e769aa130647d2354c40ea6a439bfc08"
-                f"&variables={requests.utils.quote(variables)}"
-            )
+            resp = session.get(url, headers=HEADERS, cookies=cookies,
+                             params=params, timeout=15)
 
-            resp = session.get(url, headers=HEADERS, cookies=cookies, timeout=15)
+            print(f"  Страница {page}: статус {resp.status_code}")
+
             if resp.status_code != 200:
-                print(f"Ошибка GraphQL стр.{page}: {resp.status_code}")
+                print(f"  Ответ: {resp.text[:200]}")
                 break
 
             data = resp.json()
-            media = (
-                data.get("data", {})
-                    .get("user", {})
-                    .get("edge_owner_to_timeline_media", {})
-            )
+            items = data.get("items", [])
 
-            edges = media.get("edges", [])
-            if not edges:
+            if not items:
+                print(f"  Постов больше нет")
                 break
 
-            for edge in edges:
-                node = edge.get("node", {})
-                shortcode = node.get("shortcode")
-                if not shortcode:
-                    continue
-
+            for item in items:
                 # Дата
-                timestamp = node.get("taken_at_timestamp")
+                timestamp = item.get("taken_at")
                 post_date = datetime.fromtimestamp(timestamp) if timestamp else None
 
                 # Описание
-                caption_edges = node.get("edge_media_to_caption", {}).get("edges", [])
-                caption = caption_edges[0]["node"]["text"] if caption_edges else ""
+                caption_data = item.get("caption")
+                caption = caption_data.get("text", "") if caption_data else ""
 
-                # Просмотры (только для видео)
-                views = node.get("video_view_count", 0) or 0
+                # Просмотры
+                views = item.get("view_count", 0) or item.get("play_count", 0) or 0
 
                 # Лайки
-                likes = node.get("edge_liked_by", {}).get("count", 0) or 0
+                likes = item.get("like_count", 0) or 0
 
-                # Тип
-                is_video = node.get("is_video", False)
+                # Код поста
+                code = item.get("code") or item.get("pk")
+                url_post = f"https://www.instagram.com/p/{code}/" if code else ""
 
                 posts.append({
-                    "url":      f"https://www.instagram.com/p/{shortcode}/",
-                    "caption":  caption,
-                    "views":    views,
-                    "likes":    likes,
-                    "date":     post_date,
-                    "is_video": is_video,
+                    "url":     url_post,
+                    "caption": caption,
+                    "views":   views,
+                    "likes":   likes,
+                    "date":    post_date,
                 })
 
             # Пагинация
-            page_info = media.get("page_info", {})
-            if not page_info.get("has_next_page"):
+            if not data.get("more_available"):
+                print(f"  Достигнут конец ленты")
                 break
 
-            end_cursor = page_info.get("end_cursor")
+            max_id = data.get("next_max_id")
+            if not max_id:
+                break
+
             time.sleep(random.uniform(1.5, 3))
 
         except Exception as e:
-            print(f"Ошибка GraphQL стр.{page}: {e}")
+            print(f"  Ошибка на странице {page}: {e}")
             break
 
-    print(f"@{username}: получено постов — {len(posts)}")
+    print(f"@{username}: итого постов — {len(posts)}")
     return posts
 
 
@@ -176,13 +185,13 @@ def run_parse(accounts, date_from, date_to, mode="articles"):
     results = []
 
     for account in accounts:
-        print(f"\nОбрабатываем @{account}...")
-        posts = get_profile_posts(account, cookies, session)
+        print(f"\n--- Обрабатываем @{account} ---")
+        posts = get_posts_via_api(account, session, cookies)
 
+        matched = 0
         for post in posts:
             post_date = post["date"]
 
-            # Фильтр по дате
             if post_date and not (date_from <= post_date <= date_to):
                 continue
 
@@ -191,6 +200,7 @@ def run_parse(accounts, date_from, date_to, mode="articles"):
                 if not articles:
                     continue
                 for art in articles:
+                    matched += 1
                     results.append({
                         "account":  f"@{account}",
                         "article":  art,
@@ -201,6 +211,7 @@ def run_parse(accounts, date_from, date_to, mode="articles"):
                         "caption":  post["caption"][:150].replace("\n", " "),
                     })
             else:
+                matched += 1
                 results.append({
                     "account":  f"@{account}",
                     "date":     post_date.strftime("%d.%m.%Y") if post_date else "—",
@@ -210,6 +221,8 @@ def run_parse(accounts, date_from, date_to, mode="articles"):
                     "url":      post["url"],
                     "caption":  post["caption"][:150].replace("\n", " "),
                 })
+
+        print(f"@{account}: записей добавлено — {matched}")
 
     return results
 
@@ -230,10 +243,10 @@ def parse():
         if not data:
             return jsonify({"error": "Нет данных в запросе"}), 400
 
-        accounts     = data.get("accounts", [])
-        date_from_s  = data.get("date_from", "")
-        date_to_s    = data.get("date_to", "")
-        mode         = data.get("mode", "articles")
+        accounts    = data.get("accounts", [])
+        date_from_s = data.get("date_from", "")
+        date_to_s   = data.get("date_to", "")
+        mode        = data.get("mode", "articles")
 
         if not accounts:
             return jsonify({"error": "Не указаны аккаунты"}), 400
