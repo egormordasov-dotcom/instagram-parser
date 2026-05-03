@@ -1,7 +1,7 @@
 """
-Instagram Parser Server v3
+Instagram Parser Server v4
 ===========================
-Использует актуальный Instagram API v1.
+Авторизуется через логин/пароль из переменных окружения.
 """
 
 import re
@@ -14,13 +14,28 @@ from flask import Flask, request, jsonify
 import requests
 
 app = Flask(__name__)
-COOKIES_FILE = "cookies.json"
 
-HEADERS = {
+IG_LOGIN    = os.environ.get("IG_LOGIN", "")
+IG_PASSWORD = os.environ.get("IG_PASSWORD", "")
+
+SESSION_FILE = "/tmp/ig_session.json"
+
+HEADERS_BROWSER = {
     "User-Agent": (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-        "Version/17.0 Mobile/15E148 Safari/604.1"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/123.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml",
+    "Accept-Language": "ru-RU,ru;q=0.9",
+    "Referer": "https://www.instagram.com/",
+}
+
+HEADERS_API = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/123.0.0.0 Safari/537.36"
     ),
     "Accept": "*/*",
     "Accept-Language": "ru-RU,ru;q=0.9",
@@ -29,19 +44,124 @@ HEADERS = {
     "X-IG-WWW-Claim": "0",
     "Origin": "https://www.instagram.com",
     "Referer": "https://www.instagram.com/",
+    "Content-Type": "application/x-www-form-urlencoded",
 }
 
 
-def load_cookies():
-    if not os.path.exists(COOKIES_FILE):
-        print("ВНИМАНИЕ: файл cookies.json не найден!")
-        return {}
-    with open(COOKIES_FILE, "r") as f:
-        data = json.load(f)
-    cookie_list = data if isinstance(data, list) else data.get("cookies", [])
-    result = {c["name"]: c["value"] for c in cookie_list if "name" in c and "value" in c}
-    print(f"Загружено куки: {len(result)} штук")
-    return result
+def save_session(session):
+    try:
+        with open(SESSION_FILE, "w") as f:
+            json.dump(dict(session.cookies), f)
+    except Exception as e:
+        print(f"Не удалось сохранить сессию: {e}")
+
+
+def load_session(session):
+    try:
+        if os.path.exists(SESSION_FILE):
+            with open(SESSION_FILE, "r") as f:
+                cookies = json.load(f)
+            session.cookies.update(cookies)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def is_logged_in(session):
+    try:
+        resp = session.get(
+            "https://www.instagram.com/api/v1/accounts/current_user/?edit=true",
+            headers=HEADERS_API, timeout=10
+        )
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def login(session):
+    """Авторизуется в Instagram и сохраняет сессию."""
+
+    if not IG_LOGIN or not IG_PASSWORD:
+        print("ОШИБКА: IG_LOGIN и IG_PASSWORD не заданы в переменных окружения!")
+        return False
+
+    print(f"Входим как {IG_LOGIN}...")
+
+    try:
+        # Шаг 1 — получаем csrftoken
+        resp = session.get(
+            "https://www.instagram.com/accounts/login/",
+            headers=HEADERS_BROWSER, timeout=15
+        )
+        csrf = session.cookies.get("csrftoken", "")
+        if not csrf:
+            match = re.search(r'"csrf_token":"([^"]+)"', resp.text)
+            csrf = match.group(1) if match else ""
+
+        print(f"  csrf: {csrf[:10]}...")
+        time.sleep(random.uniform(1, 2))
+
+        # Шаг 2 — отправляем логин
+        login_headers = {**HEADERS_API, "X-CSRFToken": csrf, "Referer": "https://www.instagram.com/accounts/login/"}
+        payload = {
+            "username": IG_LOGIN,
+            "enc_password": f"#PWD_INSTAGRAM_BROWSER:0:{int(time.time())}:{IG_PASSWORD}",
+            "queryParams": "{}",
+            "optIntoOneTap": "false",
+        }
+
+        resp = session.post(
+            "https://www.instagram.com/api/v1/web/accounts/login/ajax/",
+            data=payload,
+            headers=login_headers,
+            timeout=15,
+        )
+
+        print(f"  Статус входа: {resp.status_code}")
+        print(f"  Ответ: {resp.text[:200]}")
+
+        data = resp.json()
+
+        if data.get("authenticated"):
+            print("✅ Вход выполнен успешно!")
+            save_session(session)
+            return True
+        elif data.get("two_factor_required"):
+            print("❌ Требуется двухфакторная аутентификация — отключите её в настройках аккаунта")
+            return False
+        elif data.get("checkpoint_url"):
+            print("❌ Instagram требует подтверждение аккаунта — войдите вручную через браузер")
+            return False
+        else:
+            print(f"❌ Не удалось войти: {data}")
+            return False
+
+    except Exception as e:
+        print(f"❌ Ошибка при входе: {e}")
+        return False
+
+
+def get_session():
+    """Возвращает авторизованную сессию."""
+    session = requests.Session()
+
+    # Пробуем загрузить сохранённую сессию
+    if load_session(session) and is_logged_in(session):
+        print("✅ Сессия активна")
+        return session
+
+    # Иначе логинимся заново
+    print("Сессия устарела, входим заново...")
+    if login(session):
+        return session
+
+    return None
+
+
+def extract_articles(caption):
+    matches = re.findall(r"#(\d+|ww\S*)", caption, flags=re.IGNORECASE)
+    return [f"#{m.upper()}" for m in matches]
 
 
 def parse_number(s):
@@ -59,112 +179,85 @@ def parse_number(s):
         return 0
 
 
-def extract_articles(caption):
-    matches = re.findall(r"#(\d+|ww\S*)", caption, flags=re.IGNORECASE)
-    return [f"#{m.upper()}" for m in matches]
-
-
-def get_user_id(username, session, cookies):
-    """Получает user_id через страницу профиля."""
+def get_user_id(username, session):
     try:
-        url = f"https://www.instagram.com/{username}/"
-        resp = session.get(url, headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/123.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html",
-            "Referer": "https://www.instagram.com/",
-        }, cookies=cookies, timeout=15)
+        resp = session.get(
+            f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
+            headers=HEADERS_API, timeout=15
+        )
+        print(f"  Профиль @{username}: статус {resp.status_code}")
+        if resp.status_code == 200:
+            data = resp.json()
+            user_id = data.get("data", {}).get("user", {}).get("id")
+            if user_id:
+                return user_id
 
-        # Ищем user_id в HTML
+        # Запасной вариант — через HTML
+        resp = session.get(
+            f"https://www.instagram.com/{username}/",
+            headers=HEADERS_BROWSER, timeout=15
+        )
         match = re.search(r'"user_id":"(\d+)"', resp.text)
         if match:
             return match.group(1)
 
-        match = re.search(r'"id":"(\d+)"', resp.text)
-        if match:
-            return match.group(1)
-
-        print(f"user_id не найден для @{username}, статус: {resp.status_code}")
-        return None
-
     except Exception as e:
-        print(f"Ошибка получения user_id @{username}: {e}")
-        return None
+        print(f"  Ошибка получения user_id: {e}")
+    return None
 
 
-def get_posts_via_api(username, session, cookies):
-    """Получает посты через Instagram API v1."""
+def get_posts(username, session):
     posts = []
-
-    # Сначала получаем user_id
-    user_id = get_user_id(username, session, cookies)
+    user_id = get_user_id(username, session)
     if not user_id:
+        print(f"  Не удалось получить user_id для @{username}")
         return []
 
-    print(f"@{username} → user_id: {user_id}")
-
+    print(f"  user_id: {user_id}")
     max_id = None
     page = 0
 
     while True:
         page += 1
         try:
-            url = f"https://www.instagram.com/api/v1/feed/user/{user_id}/"
             params = {"count": 12}
             if max_id:
                 params["max_id"] = max_id
 
-            resp = session.get(url, headers=HEADERS, cookies=cookies,
-                             params=params, timeout=15)
+            resp = session.get(
+                f"https://www.instagram.com/api/v1/feed/user/{user_id}/",
+                headers=HEADERS_API, params=params, timeout=15
+            )
 
             print(f"  Страница {page}: статус {resp.status_code}")
 
             if resp.status_code != 200:
-                print(f"  Ответ: {resp.text[:200]}")
+                print(f"  Ответ: {resp.text[:300]}")
                 break
 
             data = resp.json()
             items = data.get("items", [])
-
             if not items:
-                print(f"  Постов больше нет")
                 break
 
             for item in items:
-                # Дата
-                timestamp = item.get("taken_at")
-                post_date = datetime.fromtimestamp(timestamp) if timestamp else None
-
-                # Описание
-                caption_data = item.get("caption")
-                caption = caption_data.get("text", "") if caption_data else ""
-
-                # Просмотры
-                views = item.get("view_count", 0) or item.get("play_count", 0) or 0
-
-                # Лайки
-                likes = item.get("like_count", 0) or 0
-
-                # Код поста
-                code = item.get("code") or item.get("pk")
-                url_post = f"https://www.instagram.com/p/{code}/" if code else ""
-
+                timestamp  = item.get("taken_at")
+                post_date  = datetime.fromtimestamp(timestamp) if timestamp else None
+                caption_d  = item.get("caption")
+                caption    = caption_d.get("text", "") if caption_d else ""
+                views      = item.get("view_count", 0) or item.get("play_count", 0) or 0
+                likes      = item.get("like_count", 0) or 0
+                code       = item.get("code") or ""
                 posts.append({
-                    "url":     url_post,
+                    "url":     f"https://www.instagram.com/p/{code}/",
                     "caption": caption,
                     "views":   views,
                     "likes":   likes,
                     "date":    post_date,
                 })
 
-            # Пагинация
             if not data.get("more_available"):
-                print(f"  Достигнут конец ленты")
                 break
-
             max_id = data.get("next_max_id")
             if not max_id:
                 break
@@ -172,26 +265,25 @@ def get_posts_via_api(username, session, cookies):
             time.sleep(random.uniform(1.5, 3))
 
         except Exception as e:
-            print(f"  Ошибка на странице {page}: {e}")
+            print(f"  Ошибка стр.{page}: {e}")
             break
 
-    print(f"@{username}: итого постов — {len(posts)}")
+    print(f"  Итого постов: {len(posts)}")
     return posts
 
 
 def run_parse(accounts, date_from, date_to, mode="articles"):
-    cookies = load_cookies()
-    session = requests.Session()
+    session = get_session()
+    if not session:
+        return []
+
     results = []
-
     for account in accounts:
-        print(f"\n--- Обрабатываем @{account} ---")
-        posts = get_posts_via_api(account, session, cookies)
+        print(f"\n--- @{account} ---")
+        posts = get_posts(account, session)
 
-        matched = 0
         for post in posts:
             post_date = post["date"]
-
             if post_date and not (date_from <= post_date <= date_to):
                 continue
 
@@ -200,7 +292,6 @@ def run_parse(accounts, date_from, date_to, mode="articles"):
                 if not articles:
                     continue
                 for art in articles:
-                    matched += 1
                     results.append({
                         "account":  f"@{account}",
                         "article":  art,
@@ -211,7 +302,6 @@ def run_parse(accounts, date_from, date_to, mode="articles"):
                         "caption":  post["caption"][:150].replace("\n", " "),
                     })
             else:
-                matched += 1
                 results.append({
                     "account":  f"@{account}",
                     "date":     post_date.strftime("%d.%m.%Y") if post_date else "—",
@@ -221,8 +311,6 @@ def run_parse(accounts, date_from, date_to, mode="articles"):
                     "url":      post["url"],
                     "caption":  post["caption"][:150].replace("\n", " "),
                 })
-
-        print(f"@{account}: записей добавлено — {matched}")
 
     return results
 
@@ -241,7 +329,7 @@ def parse():
     try:
         data = request.get_json()
         if not data:
-            return jsonify({"error": "Нет данных в запросе"}), 400
+            return jsonify({"error": "Нет данных"}), 400
 
         accounts    = data.get("accounts", [])
         date_from_s = data.get("date_from", "")
@@ -257,11 +345,9 @@ def parse():
             date_from = datetime.strptime(date_from_s, "%d.%m.%Y")
             date_to   = datetime.strptime(date_to_s,   "%d.%m.%Y")
         except ValueError:
-            return jsonify({"error": "Неверный формат даты. Используйте ДД.ММ.ГГГГ"}), 400
+            return jsonify({"error": "Неверный формат даты"}), 400
 
-        print(f"Запрос: {accounts}, {date_from_s}–{date_to_s}, режим={mode}")
         results = run_parse(accounts, date_from, date_to, mode)
-
         return jsonify({"status": "ok", "count": len(results), "results": results})
 
     except Exception as e:
